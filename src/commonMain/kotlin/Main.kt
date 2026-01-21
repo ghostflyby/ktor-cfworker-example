@@ -3,11 +3,12 @@
 package dev.ghostflyby
 
 
-import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import js.coroutines.asPromise
+import js.promise.Promise
 import web.http.Request
 import web.http.Response
 
@@ -39,9 +40,6 @@ val a = run {
 }
 
 val server = embeddedServer(CFWorker) {
-    serverConfig {
-        watchPaths = emptyList()
-    }
     routing {
         get("/") {
             call.respondText("Hello, World!")
@@ -53,18 +51,7 @@ val server = embeddedServer(CFWorker) {
     }
 }
 
-var started = false
-
-suspend fun ensuredStarted() {
-    if (!started) {
-        server.startSuspend(wait = true)
-    }
-    started = true
-}
-
 @JsExport
-suspend fun fetch(request: Request): Response {
-    ensuredStarted()
-    val result = server.engine.handle(request)
-    return result
+fun fetch(request: Request): Promise<Response> {
+    return server.engine.handle(request).asPromise()
 }
