@@ -9,7 +9,6 @@ import io.ktor.server.application.*
 import io.ktor.server.engine.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
-import io.ktor.util.*
 import io.ktor.util.pipeline.*
 import io.ktor.utils.io.*
 import js.buffer.ArrayBuffer
@@ -232,7 +231,6 @@ internal class CFResponse(call: CFWorkerCall, private val response: CompletableD
     }
 
     override fun setStatus(statusCode: HttpStatusCode) {
-        this.status(statusCode)
     }
 
     private val rawHeaders = web.http.Headers()
@@ -257,12 +255,16 @@ internal class CFResponse(call: CFWorkerCall, private val response: CompletableD
 internal class CFWorkerCall(
     jsRequest: Request,
     jsResponse: CompletableDeferred<Response>,
-    override val application: Application,
+    application: Application,
     val scope: CoroutineScope = jsRequest.asCoroutineScope(),
-    override val attributes: Attributes = Attributes(),
-) : PipelineCall {
+) : BaseApplicationCall(application) {
     override val request = CFRequest(this, jsRequest)
     override val response = CFResponse(this, jsResponse)
+
+    init {
+        putResponseAttribute()
+    }
+
     override val parameters: Parameters = request.queryParameters
 
     override val coroutineContext get() = scope.coroutineContext
