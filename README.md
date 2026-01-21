@@ -1,6 +1,6 @@
 # kotlin Ktor Cloudflare Worker
 
-Not being able to actually work for now due to https://github.com/Kotlin/kotlinx-io/issues/496
+Using monkey-patch tricks to run kotlinx-io with ESModule on Cloudflare Worker platform.
 
 ## start a local server
 
