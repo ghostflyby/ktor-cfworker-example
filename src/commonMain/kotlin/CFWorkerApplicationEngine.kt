@@ -1,0 +1,275 @@
+@file:OptIn(ExperimentalWasmJsInterop::class)
+
+package dev.ghostflyby
+
+import io.ktor.events.*
+import io.ktor.http.*
+import io.ktor.http.content.*
+import io.ktor.server.application.*
+import io.ktor.server.engine.*
+import io.ktor.server.request.*
+import io.ktor.server.response.*
+import io.ktor.util.*
+import io.ktor.util.pipeline.*
+import io.ktor.utils.io.*
+import js.buffer.ArrayBuffer
+import js.buffer.ArrayBufferLike
+import js.iterable.toList
+import js.typedarrays.Uint8Array
+import js.typedarrays.toByteArray
+import js.typedarrays.toUint8Array
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.launch
+import web.abort.asCoroutineScope
+import web.http.BodyInit
+import web.http.Request
+import web.http.Response
+import web.http.ResponseInit
+import web.streams.ReadableStream
+import web.streams.read
+
+class CFWorkerApplicationEngine(
+    environment: ApplicationEnvironment,
+    monitor: Events, developmentMode: Boolean,
+    val configuration: Configuration,
+    private val applicationProvider: () -> Application
+) : BaseApplicationEngine(environment, monitor, developmentMode) {
+
+    class Configuration : BaseApplicationEngine.Configuration()
+
+    private val startGate = CompletableDeferred<Unit>()
+    private var started = false
+
+    override fun start(wait: Boolean): ApplicationEngine {
+        startGate.complete(Unit)
+        started = true
+        return this
+    }
+
+    suspend fun handle(request: Request): Response {
+        startGate.await()
+        if (!started) {
+            throw IllegalStateException("CFWorkerApplicationEngine is not started")
+        }
+        val deferred = CompletableDeferred<Response>()
+        val scope = request.asCoroutineScope()
+        scope.launch {
+
+            pipeline.execute(
+                CFWorkerCall(
+                    request,
+                    deferred,
+                    applicationProvider(),
+                    scope,
+                )
+            )
+        }
+        return deferred.await()
+    }
+
+    override fun stop(gracePeriodMillis: Long, timeoutMillis: Long) {
+
+    }
+
+}
+
+fun <T : ArrayBufferLike> ReadableStream<Uint8Array<T>>.toByteChannel(scope: CoroutineScope): ByteChannel {
+    val channel = ByteChannel(autoFlush = true)
+    val reader = getReader()
+    scope.launch {
+        try {
+            while (true) {
+                val result = reader.read()
+                if (result.done) break
+                val bytes = result.value?.toByteArray() ?: break
+                channel.writeByteArray(bytes)
+            }
+            channel.close()
+        } catch (t: Throwable) {
+            channel.close(t)
+        } finally {
+            try {
+                reader.releaseLock()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    return channel
+}
+
+
+internal class CFRequest(
+    call: CFWorkerCall,
+    private val request: Request
+) : BaseApplicationRequest(call) {
+    override val engineHeaders: Headers by lazy {
+        Headers.build {
+            request.headers.forEach { key, value ->
+                this.append(key, value)
+            }
+        }
+    }
+    override val engineReceiveChannel: ByteReadChannel =
+        request.body?.toByteChannel(call.scope) ?: ByteReadChannel.Empty
+
+    override val cookies: RequestCookies by lazy {
+        RequestCookies(this)
+    }
+
+    private val url = Url(request.url)
+
+
+    override val local: RequestConnectionPoint by lazy {
+        object : RequestConnectionPoint {
+            override val scheme: String
+                get() = url.protocol.name
+            override val version: String by lazy {
+                request.asDynamic().cf?.httpVersion
+            }
+
+
+            @Deprecated("Use localPort or serverPort instead", level = DeprecationLevel.ERROR)
+            override val port: Int
+                get() = url.port
+            override val localPort: Int
+                get() = url.port
+            override val serverPort: Int
+                get() = url.port
+
+            @Deprecated("Use localHost or serverHost instead", level = DeprecationLevel.ERROR)
+            override val host: String
+                get() = url.host
+            override val localHost: String
+                get() = url.host
+            override val serverHost: String
+                get() = url.host
+            override val localAddress: String = ""
+
+            override val uri: String
+                get() = request.url
+
+            override val method: HttpMethod by lazy {
+                HttpMethod.parse(request.method.toString())
+            }
+
+            override val remoteHost: String get() = remoteAddress
+            override val remotePort: Int = 0
+            override val remoteAddress: String = request.headers.get("CF-Connecting-IP") ?: ""
+
+        }
+    }
+
+    override val queryParameters: Parameters = url.parameters
+
+    override val rawQueryParameters: Parameters = url.parameters
+
+}
+
+internal class CFResponse(call: CFWorkerCall, private val response: CompletableDeferred<Response>) :
+    BaseApplicationResponse(call) {
+    override suspend fun respondUpgrade(upgrade: OutgoingContent.ProtocolUpgrade) {
+    }
+
+    private val scope: CoroutineScope = call.scope
+
+    override suspend fun responseChannel(): ByteWriteChannel {
+        val stream = ReadableStream<Uint8Array<ArrayBuffer>>()
+        val channel = stream.toByteChannel(scope)
+        val body = BodyInit(stream)
+        val response = Response(body, responseInit())
+        this.response.complete(response)
+        return channel
+    }
+
+    override suspend fun respondOutgoingContent(content: OutgoingContent) {
+        val response = content.toResponse()
+        if (response != null) {
+            this.response.complete(response)
+            return
+        }
+    }
+
+    fun responseInit(): ResponseInit {
+        val status = status() ?: HttpStatusCode.OK
+        val code = status.value.toShort()
+        val des = status.description
+        return ResponseInit(rawHeaders, code, des)
+    }
+
+
+    private fun OutgoingContent.toResponse(): Response? {
+        fun responseInit(): ResponseInit {
+            commitHeaders(this@toResponse)
+            val status = status() ?: HttpStatusCode.OK
+            val code = status.value.toShort()
+            val des = status.description
+            return ResponseInit(rawHeaders, code, des)
+        }
+
+        fun BodyInit.response(): Response {
+            return Response(this, responseInit())
+        }
+        return when (this) {
+            is ByteArrayContent -> BodyInit(bytes().toUint8Array()).response()
+            is TextContent -> BodyInit(text).response()
+            is OutgoingContent.NoContent -> Response(init = responseInit())
+            else -> null
+        }
+    }
+
+    override fun setStatus(statusCode: HttpStatusCode) {
+        this.status(statusCode)
+    }
+
+    private val rawHeaders = web.http.Headers()
+
+    override val headers: ResponseHeaders = object : ResponseHeaders() {
+        override fun engineAppendHeader(name: String, value: String) {
+            rawHeaders.append(name, value)
+        }
+
+        override fun getEngineHeaderNames(): List<String> {
+            return rawHeaders.keys().toList()
+        }
+
+        override fun getEngineHeaderValues(name: String): List<String> {
+            return rawHeaders.values().toList()
+        }
+
+    }
+
+}
+
+internal class CFWorkerCall(
+    jsRequest: Request,
+    jsResponse: CompletableDeferred<Response>,
+    override val application: Application,
+    val scope: CoroutineScope = jsRequest.asCoroutineScope(),
+    override val attributes: Attributes = Attributes(),
+) : PipelineCall {
+    override val request = CFRequest(this, jsRequest)
+    override val response = CFResponse(this, jsResponse)
+    override val parameters: Parameters = request.queryParameters
+
+    override val coroutineContext get() = scope.coroutineContext
+
+}
+
+object CFWorker :
+    ApplicationEngineFactory<CFWorkerApplicationEngine, CFWorkerApplicationEngine.Configuration> {
+    override fun configuration(configure: CFWorkerApplicationEngine.Configuration.() -> Unit): CFWorkerApplicationEngine.Configuration {
+        return CFWorkerApplicationEngine.Configuration().apply(configure)
+    }
+
+    override fun create(
+        environment: ApplicationEnvironment,
+        monitor: Events,
+        developmentMode: Boolean,
+        configuration: CFWorkerApplicationEngine.Configuration,
+        applicationProvider: () -> Application
+    ): CFWorkerApplicationEngine {
+        return CFWorkerApplicationEngine(environment, monitor, developmentMode, configuration, applicationProvider)
+    }
+}

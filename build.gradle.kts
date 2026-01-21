@@ -3,6 +3,7 @@ import org.jetbrains.kotlin.gradle.targets.web.yarn.BaseYarnRootEnvSpec
 
 plugins {
     kotlin("multiplatform") version "2.3.0"
+    kotlin("plugin.js-plain-objects") version "2.3.0"
 }
 
 group = "dev.ghostflyby"
@@ -19,6 +20,21 @@ kotlin {
         generateTypeScriptDefinitions()
         binaries.executable()
     }
+
+    sourceSets {
+        val commonMain by getting {
+            dependencies {
+//                implementation("io.ktor:ktor-http:3.3.0")
+                implementation("io.ktor:ktor-server-core-js:3.3.0")
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
+                implementation(kotlinWrappers.web)
+            }
+        }
+    }
+
+    compilerOptions {
+        freeCompilerArgs.add("-Xenable-suspend-function-exporting")
+    }
 }
 
 
@@ -26,7 +42,7 @@ extensions.configure<BaseNodeJsEnvSpec> {
     download = false
 }
 
-extensions.configure<BaseYarnRootEnvSpec>() {
+extensions.configure<BaseYarnRootEnvSpec> {
     download = false
 }
 
