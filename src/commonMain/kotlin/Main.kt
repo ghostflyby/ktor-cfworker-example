@@ -11,6 +11,33 @@ import io.ktor.server.routing.*
 import web.http.Request
 import web.http.Response
 
+@JsModule("node:os")
+external val os: dynamic
+
+@JsModule("node:fs")
+external val fs: dynamic
+
+@JsModule("node:path")
+external val path: dynamic
+
+fun fakeRequire(module: String): dynamic {
+    when (module) {
+        "os" -> return os
+        "fs" -> return fs
+        "path" -> return path
+    }
+    throw Error("Cannot require module: $module")
+}
+
+fun fakeEval(s: String): dynamic {
+    if (s == "require") return ::fakeRequire
+    throw Error("Cannot eval: $s")
+}
+
+val a = run {
+    js("globalThis").eval = ::fakeEval
+}
+
 val server = embeddedServer(CFWorker) {
     serverConfig {
         watchPaths = emptyList()
@@ -26,7 +53,18 @@ val server = embeddedServer(CFWorker) {
     }
 }
 
+var started = false
+
+suspend fun ensuredStarted() {
+    if (!started) {
+        server.startSuspend(wait = true)
+    }
+    started = true
+}
+
 @JsExport
 suspend fun fetch(request: Request): Response {
-    return server.engine.handle(request)
+    ensuredStarted()
+    val result = server.engine.handle(request)
+    return result
 }

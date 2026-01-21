@@ -41,9 +41,12 @@ class CFWorkerApplicationEngine(
     private val startGate = CompletableDeferred<Unit>()
     private var started = false
 
+    private lateinit var application: Application
+
     override fun start(wait: Boolean): ApplicationEngine {
-        startGate.complete(Unit)
         started = true
+        application = applicationProvider()
+        startGate.complete(Unit)
         return this
     }
 
@@ -55,15 +58,23 @@ class CFWorkerApplicationEngine(
         val deferred = CompletableDeferred<Response>()
         val scope = request.asCoroutineScope()
         scope.launch {
-
-            pipeline.execute(
-                CFWorkerCall(
-                    request,
-                    deferred,
-                    applicationProvider(),
-                    scope,
+            try {
+                pipeline.execute(
+                    CFWorkerCall(
+                        request,
+                        deferred,
+                        application,
+                        scope,
+                    )
                 )
-            )
+            } catch (t: Throwable) {
+                if (!deferred.isCompleted) {
+                    val headers = web.http.Headers()
+                    val body = BodyInit("Internal Server Error: ${t.message}")
+                    deferred.complete(Response(body, ResponseInit(headers, 500, "Internal Server Error")))
+                }
+                throw t
+            }
         }
         return deferred.await()
     }
@@ -106,7 +117,8 @@ internal class CFRequest(
 ) : BaseApplicationRequest(call) {
     override val engineHeaders: Headers by lazy {
         Headers.build {
-            request.headers.forEach { key, value ->
+            // JS Headers.forEach provides (value, key); order matters.
+            request.headers.forEach { value, key ->
                 this.append(key, value)
             }
         }
@@ -148,7 +160,7 @@ internal class CFRequest(
             override val localAddress: String = ""
 
             override val uri: String
-                get() = request.url
+                get() = url.fullPath
 
             override val method: HttpMethod by lazy {
                 HttpMethod.parse(request.method.toString())
