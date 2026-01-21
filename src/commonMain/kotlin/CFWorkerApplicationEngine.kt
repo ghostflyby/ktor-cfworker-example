@@ -37,15 +37,23 @@ class CFWorkerApplicationEngine(
 
     class Configuration : BaseApplicationEngine.Configuration()
 
+    private val startGate = CompletableDeferred<Unit>()
+    private var started = false
 
     private lateinit var application: Application
 
     override fun start(wait: Boolean): ApplicationEngine {
+        started = true
         application = applicationProvider()
+        startGate.complete(Unit)
         return this
     }
 
-    fun handle(request: Request): CompletableDeferred<Response> {
+    suspend fun handle(request: Request): Response {
+        startGate.await()
+        if (!started) {
+            throw IllegalStateException("CFWorkerApplicationEngine is not started")
+        }
         val deferred = CompletableDeferred<Response>()
         val scope = request.asCoroutineScope()
         scope.launch {
@@ -67,7 +75,7 @@ class CFWorkerApplicationEngine(
                 throw t
             }
         }
-        return deferred
+        return deferred.await()
     }
 
     override fun stop(gracePeriodMillis: Long, timeoutMillis: Long) {
