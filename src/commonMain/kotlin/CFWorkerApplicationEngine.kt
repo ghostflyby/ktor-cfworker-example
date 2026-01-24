@@ -2,6 +2,7 @@
 
 package dev.ghostflyby
 
+import dev.ghostflyby.cloudflare.workers.waitUntil
 import io.ktor.events.*
 import io.ktor.http.*
 import io.ktor.http.content.*
@@ -11,8 +12,11 @@ import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.util.pipeline.*
 import io.ktor.utils.io.*
+import io.ktor.utils.io.pool.*
 import js.buffer.ArrayBuffer
 import js.buffer.ArrayBufferLike
+import js.coroutines.asPromise
+import js.coroutines.promise
 import js.iterable.toList
 import js.typedarrays.Uint8Array
 import js.typedarrays.toByteArray
@@ -26,6 +30,8 @@ import web.http.Request
 import web.http.Response
 import web.http.ResponseInit
 import web.streams.ReadableStream
+import web.streams.ReadableStreamDefaultController
+import web.streams.UnderlyingDefaultSource
 import web.streams.read
 
 class CFWorkerApplicationEngine(
@@ -109,6 +115,44 @@ fun <T : ArrayBufferLike> ReadableStream<Uint8Array<T>>.toByteChannel(scope: Cor
     return channel
 }
 
+private fun ByteReadChannel.toReadableStream(scope: CoroutineScope): ReadableStream<Uint8Array<ArrayBuffer>> {
+    return ReadableStream(
+        UnderlyingDefaultSource(
+            start = { _: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> ->
+                // Unit
+            },
+            pull = { c: ReadableStreamDefaultController<Uint8Array<ArrayBuffer>> ->
+                scope.promise {
+                    val buffer = ByteArrayPool.borrow()
+                    try {
+                        val n = readAvailable(buffer)
+                        if (n <= 0) {
+                            c.close()
+                            return@promise
+                        }
+
+                        val src = buffer.sliceArray(0 until n)
+
+                        c.enqueue(src.toUint8Array())
+                    } finally {
+                        ByteArrayPool.recycle(buffer)
+                    }
+                }.asDynamic()
+            },
+            cancel = { reason: Any? ->
+                scope.promise {
+                    val cause = when (reason) {
+                        is Throwable -> reason
+                        null -> CancellationException("ReadableStream cancelled")
+                        else -> CancellationException(reason.toString())
+                    }
+                    cancel(cause)
+                }.asDynamic()
+            }
+        )
+    )
+}
+
 
 internal class CFRequest(
     call: CFWorkerCall,
@@ -186,8 +230,10 @@ internal class CFResponse(call: CFWorkerCall, private val response: CompletableD
     private val scope: CoroutineScope = call.scope
 
     override suspend fun responseChannel(): ByteWriteChannel {
-        val stream = ReadableStream<Uint8Array<ArrayBuffer>>()
-        val channel = stream.toByteChannel(scope)
+        val channel = ByteChannel(autoFlush = true)
+        val stream = channel.toReadableStream(scope)
+        val deferred = CompletableDeferred<Unit>()
+        waitUntil(deferred.asPromise())
         val body = BodyInit(stream)
         val response = Response(body, responseInit())
         this.response.complete(response)
@@ -200,6 +246,7 @@ internal class CFResponse(call: CFWorkerCall, private val response: CompletableD
             this.response.complete(response)
             return
         }
+        return super.respondOutgoingContent(content)
     }
 
     fun responseInit(): ResponseInit {
@@ -213,10 +260,7 @@ internal class CFResponse(call: CFWorkerCall, private val response: CompletableD
     private fun OutgoingContent.toResponse(): Response? {
         fun responseInit(): ResponseInit {
             commitHeaders(this@toResponse)
-            val status = status() ?: HttpStatusCode.OK
-            val code = status.value.toShort()
-            val des = status.description
-            return ResponseInit(rawHeaders, code, des)
+            return this@CFResponse.responseInit()
         }
 
         fun BodyInit.response(): Response {
@@ -256,7 +300,7 @@ internal class CFWorkerCall(
     jsRequest: Request,
     jsResponse: CompletableDeferred<Response>,
     application: Application,
-    val scope: CoroutineScope = jsRequest.asCoroutineScope(),
+    val scope: CoroutineScope,
 ) : BaseApplicationCall(application) {
     override val request = CFRequest(this, jsRequest)
     override val response = CFResponse(this, jsResponse)

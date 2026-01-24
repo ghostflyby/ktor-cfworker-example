@@ -8,6 +8,7 @@ import io.ktor.server.engine.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
+import io.ktor.utils.io.*
 import web.http.Request
 import web.http.Response
 
@@ -49,6 +50,11 @@ val server = embeddedServer(CFWorker) {
         post("/echo") {
             val receivedText = call.receiveText()
             call.respondText("Echo: $receivedText")
+        }
+        get("stream") {
+            call.respondBytesWriter {
+                writeByteArray("Streaming response...".encodeToByteArray())
+            }
         }
     }
 }
